@@ -3,29 +3,25 @@ const os = require("os");
 const webpack = require("webpack");
 const pty = require("node-pty");
 
-// const rewire = require("rewire");
-// const createConsoleLogger = require("webpack/lib/logging/createConsoleLogger");
+class TscError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TscError";
+    this.stack = "";
+  }
+}
 
-// const nodeConsole = rewire("webpack/lib/node/nodeConsole");
-// nodeConsole.info = nodeConsole.__get__("writeColored")("<i> ", "", "");
+const removeNewLinesAtEnd = (str) => str.replace(/(\r\n|\n|\r)+$/g, "");
 
 const PLUGIN_NAME = "tsc-plugin";
 
 class TscWebpackPlugin {
-  constructor() {
+  constructor(options = {}) {
+    this.options = options;
     this.initialized = false;
   }
-  apply(compiler) {
-    // TODO: opt out from webpack info log colors
-    // compiler.infrastructureLogger = createConsoleLogger({
-    //   level: "info",
-    //   debug: false,
-    //   console: nodeConsole,
-    // });
-
-    const logger = compiler.getInfrastructureLogger(PLUGIN_NAME);
-
-    const isWatchPromise = new Promise((resolve) => {
+  async apply(compiler) {
+    const isWatch = await new Promise((resolve) => {
       compiler.hooks.run.tap(PLUGIN_NAME, () => {
         if (!this.initialized) {
           this.initialized = true;
@@ -43,34 +39,72 @@ class TscWebpackPlugin {
       });
     });
 
-    isWatchPromise.then((isWatch) => {
-      const file = path.resolve(
-        compiler.context,
-        `./node_modules/.bin/tsc${os.platform() === "win32" ? ".exe" : ""}`
-      );
+    const file = path.resolve(
+      compiler.context,
+      `./node_modules/.bin/tsc${os.platform() === "win32" ? ".exe" : ""}`
+    );
 
-      const watchArgs = ["--watch", "--preserveWatchOutput"];
+    const options = {
+      ...this.options,
+      ...(isWatch ? { watch: "", preserveWatchOutput: "" } : {}),
+    };
 
-      if (!isWatch) {
-        logger.info("Starting typechecking...");
+    const args = [
+      ...new Set(
+        Object.keys(options)
+          .reduce((acc, key) => [...acc, `--${key}`, String(options[key])], [])
+          .filter(Boolean)
+      ),
+    ];
+
+    const ptyProcess = pty.spawn(file, args, {
+      name: "xterm-color",
+    });
+
+    process.once("exit", () => {
+      ptyProcess.emit("exit");
+    });
+
+    const logger = compiler.getInfrastructureLogger(PLUGIN_NAME);
+
+    let messages = [];
+
+    ptyProcess.onData((data) => {
+      if (isWatch) {
+        logger.info(removeNewLinesAtEnd(data));
+      } else {
+        messages.push(data);
       }
+    });
 
-      const ptyProcess = pty.spawn(file, isWatch ? watchArgs : [], {
-        name: "xterm-color",
-      });
+    if (!isWatch) {
+      logger.info("Starting typechecking...");
 
-      ptyProcess.onData((data) => {
-        logger.info(data.slice(0, -1));
-      });
+      compiler.hooks.afterEmit.tapPromise(PLUGIN_NAME, async (compilation) => {
+        await new Promise((resolve) => {
+          ptyProcess.onExit(() => {
+            resolve();
+          });
+        });
 
-      ptyProcess.onExit((event) => {
-        if (event.exitCode === 0) {
-          logger.info(`Found 0 errors.`);
+        if (messages.length > 0) {
+          messages
+            .map((m) =>
+              removeNewLinesAtEnd(
+                m
+                  .split("\r\n")
+                  .map((s) => s.replace(/^Found \d+ errors?\b.$/, ""))
+                  .join("\r\n")
+              )
+            )
+            .filter(Boolean)
+            .map((m) => compilation.errors.push(new TscError(m)));
+          messages = [];
         } else {
-          throw new Error("TODO: tsc");
+          logger.info("Found 0 errors.");
         }
       });
-    });
+    }
   }
 }
 
